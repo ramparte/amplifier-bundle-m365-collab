@@ -15,7 +15,7 @@ bundle:
 
 # Tool module (now self-contained in this repo)
 tools:
-  - module: m365-collab
+  - module: tool-m365-collab
     source: git+https://github.com/ramparte/amplifier-bundle-m365-collab@main
     config:
       # Credentials loaded from environment variables:
