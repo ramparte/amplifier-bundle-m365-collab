@@ -6,17 +6,17 @@
 #
 # Usage:
 #   includes:
-#     - bundle: git+https://github.com/ramparte/amplifier-toolkit@main#subdirectory=bundles/m365-collab
+#     - bundle: git+https://github.com/ramparte/amplifier-bundle-m365-collab@main
 
 bundle:
   name: m365-collab
-  version: 0.1.0
+  version: 0.2.0
   description: Agent collaboration via M365 SharePoint - tasks, status, handoffs
 
-# Tool module
+# Tool module (now self-contained in this repo)
 tools:
   - module: m365-collab
-    source: git+https://github.com/ramparte/amplifier-toolkit@main#subdirectory=tools/m365-collab
+    source: git+https://github.com/ramparte/amplifier-bundle-m365-collab@main
     config:
       # Credentials loaded from environment variables:
       # - M365_TENANT_ID
