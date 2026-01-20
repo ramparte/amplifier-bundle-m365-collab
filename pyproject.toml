@@ -20,5 +20,5 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/m365_collab"]
 
-[project.entry-points."amplifier.tools"]
-m365_collab = "m365_collab:M365CollabTool"
+[project.entry-points."amplifier.modules"]
+tool-m365-collab = "m365_collab:mount"
