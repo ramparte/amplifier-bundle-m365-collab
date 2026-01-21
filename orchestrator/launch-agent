@@ -1,0 +1,47 @@
+#!/bin/bash
+# Launch an Amplifier agent session with proper identity
+# Usage: launch-agent <agent-name> [initial-prompt]
+
+set -e
+
+AGENT_NAME="$1"
+INITIAL_PROMPT="${2:-Check for pending tasks and introduce yourself}"
+
+if [ -z "$AGENT_NAME" ]; then
+    echo "Usage: launch-agent <agent-name> [initial-prompt]"
+    echo ""
+    echo "Available agents:"
+    echo "  buckaroo-banzai   - Coordinator, strategy"
+    echo "  perfect-tommy     - Implementer, building"
+    echo "  new-jersey        - Researcher, investigation"
+    echo "  reno-nevada       - Reviewer, quality"
+    echo "  pecos             - Explorer, creative"
+    echo "  pinky-carruthers  - Dispatcher, coordination"
+    echo "  penny-priddy      - Analyst, insights"
+    echo "  professor-hikita  - Advisor, wisdom"
+    exit 1
+fi
+
+# Load M365 credentials
+CONFIG_DIR="$HOME/.m365-tenant"
+if [ -f "$CONFIG_DIR/credentials.json" ]; then
+    export M365_TENANT_ID=$(jq -r '.tenant_id' "$CONFIG_DIR/credentials.json")
+    export M365_CLIENT_ID=$(jq -r '.app.client_id' "$CONFIG_DIR/credentials.json")
+    export M365_CLIENT_SECRET=$(jq -r '.app.client_secret' "$CONFIG_DIR/credentials.json")
+fi
+
+# Set agent identity
+export AGENT_NAME="$AGENT_NAME"
+
+echo "🎸 Launching $AGENT_NAME..."
+echo "   Identity: $AGENT_NAME"
+echo "   M365: Connected"
+echo ""
+
+# Find the bundle directory
+BUNDLE_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
+
+# Launch Amplifier with the agent's persona bundle
+amplifier run \
+    --bundle "$BUNDLE_DIR/personas/$AGENT_NAME.md" \
+    "$INITIAL_PROMPT"

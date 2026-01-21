@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""M365 Agent Collaboration CLI - Agent-to-agent communication via SharePoint."""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+
+try:
+    import msal
+    import httpx
+except ImportError:
+    print("ERROR: pip install msal httpx", file=sys.stderr)
+    sys.exit(1)
+
+
+class M365Collab:
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    FOLDER = "AgentMessages"
+
+    def __init__(self, agent_name=None):
+        self.tenant_id = os.environ.get("M365_TENANT_ID")
+        self.client_id = os.environ.get("M365_CLIENT_ID")
+        self.client_secret = os.environ.get("M365_CLIENT_SECRET")
+        self.agent_name = agent_name or os.environ.get("AGENT_NAME", "unknown")
+
+        if not all([self.tenant_id, self.client_id, self.client_secret]):
+            missing = [k for k in ["M365_TENANT_ID", "M365_CLIENT_ID", "M365_CLIENT_SECRET"]
+                       if not os.environ.get(k)]
+            raise ValueError(f"Missing: {', '.join(missing)}")
+
+        self._app = msal.ConfidentialClientApplication(
+            client_id=self.client_id, client_credential=self.client_secret,
+            authority=f"https://login.microsoftonline.com/{self.tenant_id}")
+        self._http = httpx.Client(timeout=30.0, follow_redirects=True)
+        self._drive_id = None
+
+    def _get_token(self):
+        result = self._app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        return result.get("access_token") or (_ for _ in ()).throw(RuntimeError(result.get("error_description")))
+
+    def _request(self, method, path, json_data=None, content=None):
+        url = f"{self.GRAPH_BASE}{path}"
+        headers = {"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"}
+        return self._http.request(method, url, headers=headers, **({"json": json_data} if json_data else {"content": content} if content else {}))
+
+    @property
+    def drive_id(self):
+        if not self._drive_id:
+            resp = self._request("GET", "/sites/root/drive")
+            self._drive_id = resp.json()["id"] if resp.status_code == 200 else None
+        return self._drive_id
+
+    def get_messages(self, for_agent=None, from_agent=None, message_type=None, status=None, limit=50):
+        resp = self._request("GET", f"/drives/{self.drive_id}/root:/{self.FOLDER}:/children?$top={limit}")
+        if resp.status_code != 200: return []
+        messages = []
+        for item in resp.json().get("value", []):
+            if not item["name"].endswith(".json"): continue
+            url = item.get("@microsoft.graph.downloadUrl")
+            if url:
+                content = self._http.get(url)
+                if content.status_code == 200:
+                    try:
+                        msg = content.json()
+                        if for_agent and msg.get("to") not in [for_agent, "all"]: continue
+                        if from_agent and msg.get("from") != from_agent: continue
+                        if message_type and msg.get("message_type") != message_type: continue
+                        if status and msg.get("status") != status: continue
+                        messages.append(msg)
+                    except: pass
+        return sorted(messages, key=lambda m: m.get("timestamp", ""), reverse=True)
+
+    def get_my_tasks(self, status=None):
+        return self.get_messages(for_agent=self.agent_name, message_type="task", status=status)
+
+    def post_message(self, title, content, to_agent="controller", message_type="message", 
+                     priority="normal", in_reply_to=None):
+        self._request("POST", f"/drives/{self.drive_id}/root/children",
+                     json_data={"name": self.FOLDER, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"})
+        msg = {
+            "id": f"msg-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "from": self.agent_name, "to": to_agent, "message_type": message_type,
+            "title": title, "content": content, "priority": priority,
+            "status": "pending" if message_type == "task" else "delivered",
+        }
+        if in_reply_to: msg["in_reply_to"] = in_reply_to
+        resp = self._request("PUT", f"/drives/{self.drive_id}/root:/{self.FOLDER}/{msg['id']}.json:/content",
+                           content=json.dumps(msg, indent=2).encode())
+        return msg if resp.status_code in (200, 201) else None
+
+    def respond(self, task_id, response_text):
+        filename = f"{task_id}.json" if not task_id.endswith(".json") else task_id
+        resp = self._request("GET", f"/drives/{self.drive_id}/root:/{self.FOLDER}/{filename}:/content")
+        original_from, original_title = "controller", "Task"
+        if resp.status_code == 200:
+            original = resp.json()
+            original_from, original_title = original.get("from", "controller"), original.get("title", "Task")
+            original["status"] = "completed"
+            original.setdefault("context", {})["response"] = response_text
+            original["context"]["responded_by"] = self.agent_name
+            self._request("PUT", f"/drives/{self.drive_id}/root:/{self.FOLDER}/{filename}:/content",
+                         content=json.dumps(original, indent=2).encode())
+        return self.post_message(f"Re: {original_title}", response_text, to_agent=original_from,
+                                message_type="response", in_reply_to=task_id)
+
+    def dispatch(self, to_agent, title, instruction, priority="normal"):
+        return self.post_message(title, instruction, to_agent=to_agent, message_type="task", priority=priority)
+
+
+def main():
+    p = argparse.ArgumentParser(description="M365 Agent Collaboration")
+    p.add_argument("--agent", help="Agent name")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("my-tasks").add_argument("--status", choices=["pending", "in_progress", "completed"])
+    r = sub.add_parser("respond"); r.add_argument("--task-id", required=True); r.add_argument("--message", required=True)
+    d = sub.add_parser("dispatch"); d.add_argument("--to", required=True); d.add_argument("--title", required=True); d.add_argument("--instruction", required=True)
+    g = sub.add_parser("get-messages"); g.add_argument("--for", dest="for_agent"); g.add_argument("--from", dest="from_agent"); g.add_argument("--type"); g.add_argument("--limit", type=int, default=50)
+    
+    args = p.parse_args()
+    try:
+        c = M365Collab(agent_name=args.agent)
+        if args.cmd == "my-tasks":
+            tasks = c.get_my_tasks(status=getattr(args, 'status', None))
+            print(json.dumps({"success": True, "count": len(tasks), "tasks": tasks}, indent=2))
+        elif args.cmd == "respond":
+            print(json.dumps({"success": True, "response": c.respond(args.task_id, args.message)}, indent=2))
+        elif args.cmd == "dispatch":
+            print(json.dumps({"success": True, "task": c.dispatch(args.to, args.title, args.instruction)}, indent=2))
+        elif args.cmd == "get-messages":
+            msgs = c.get_messages(for_agent=args.for_agent, from_agent=args.from_agent, message_type=args.type, limit=args.limit)
+            print(json.dumps({"success": True, "count": len(msgs), "messages": msgs}, indent=2))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}, indent=2)); sys.exit(1)
+
+if __name__ == "__main__": main()

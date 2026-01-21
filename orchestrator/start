@@ -1,0 +1,6 @@
+#!/bin/bash
+# Quick start for agent sessions
+# Usage: ./start <agent-name>
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+"$SCRIPT_DIR/launch-agent" "$@"
