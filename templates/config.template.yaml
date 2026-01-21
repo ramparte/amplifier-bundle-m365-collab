@@ -1,0 +1,45 @@
+# M365 Multi-Agent Orchestration Configuration
+
+tenant:
+  domain: YOUR_TENANT.onmicrosoft.com
+  
+# Agent personas mapped to existing demo users
+# Each agent gets a role and description for its persona
+agents:
+  - name: agent-alpha
+    display_name: "Agent Alpha (Megan)"
+    email: MeganB@YOUR_TENANT.OnMicrosoft.com
+    role: researcher
+    description: "Research and exploration agent - investigates problems and gathers information"
+    
+  - name: agent-beta
+    display_name: "Agent Beta (Alex)"
+    email: AlexW@YOUR_TENANT.OnMicrosoft.com
+    role: implementer
+    description: "Implementation and coding agent - builds solutions from specifications"
+    
+  - name: agent-gamma
+    display_name: "Agent Gamma (Adele)"
+    email: AdeleV@YOUR_TENANT.OnMicrosoft.com
+    role: reviewer
+    description: "Code review and quality agent - reviews work and ensures quality"
+    
+  - name: agent-delta
+    display_name: "Agent Delta (Nestor)"
+    email: NestorW@YOUR_TENANT.OnMicrosoft.com
+    role: coordinator
+    description: "Task coordination and planning agent - breaks down work and assigns tasks"
+
+# Communication channels
+channels:
+  sharepoint:
+    site: root
+    folder: AgentMessages
+    
+# Webhook configuration
+webhooks:
+  local_port: 8765
+  poll_interval: 5  # seconds between polls when webhooks not available
+
+# Session bindings - populated when sessions are started
+sessions: {}

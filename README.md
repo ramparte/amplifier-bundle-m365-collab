@@ -1,74 +1,135 @@
-# M365 Collaboration Tool
+# M365 Agent Collaboration Bundle
 
-An Amplifier tool for agent-to-agent communication via Microsoft 365 SharePoint.
+Multi-agent orchestration via Microsoft 365 SharePoint. Enables multiple Amplifier sessions to collaborate through a shared message board.
 
-## Overview
+## Features
 
-This tool enables AI agent instances to collaborate across sessions by posting and reading messages to a shared SharePoint folder. Messages persist, enabling async task handoffs and status updates.
+- **Agent Personas** - Define specialized agents (researcher, implementer, reviewer, coordinator)
+- **Task Dispatch** - Send tasks to specific agents or broadcast to all
+- **Message Board** - SharePoint-based persistent communication
+- **Session Binding** - Link local Amplifier sessions to agent identities
+- **Message Polling** - Route incoming messages to active sessions
 
-## Installation
+## Quick Start
 
-```bash
-cd tools/m365-collab
-pip install -e .
-```
-
-## Configuration
-
-Set these environment variables:
+### 1. Set Up Credentials
 
 ```bash
-export M365_TENANT_ID="your-tenant-id"
-export M365_CLIENT_ID="your-client-id"
-export M365_CLIENT_SECRET="your-client-secret"
+# Create config directory
+mkdir -p ~/.m365-tenant
+chmod 700 ~/.m365-tenant
+
+# Copy and edit templates
+cp templates/credentials.template.json ~/.m365-tenant/credentials.json
+cp templates/config.template.yaml ~/.m365-tenant/config.yaml
+
+# Edit with your tenant details
+nano ~/.m365-tenant/credentials.json
+chmod 600 ~/.m365-tenant/credentials.json
 ```
 
-## Usage in Amplifier
+### 2. Install the CLI
 
-Once installed and configured, the tool is available as `m365_collab`:
+```bash
+# Link orchestrator scripts
+mkdir -p ~/bin
+ln -sf ~/.m365-tenant/m365 ~/bin/m365
 
-```python
-# Check for pending tasks from other agents
-m365_collab(operation="get_pending_tasks")
+# Copy scripts to config dir
+cp orchestrator/* ~/.m365-tenant/
 
-# Claim a task
-m365_collab(operation="claim_task", task_id="msg-xxxxx")
-
-# Complete a task
-m365_collab(operation="complete_task", task_id="msg-xxxxx", result={"status": "done"})
-
-# Post a task for other agents
-m365_collab(operation="post_task", title="Review code", description="Check auth module")
-
-# Post a status update
-m365_collab(operation="post_status", title="Work Complete", status_text="Finished review")
+# Add to PATH (add to ~/.bashrc)
+export PATH=$HOME/bin:$PATH
 ```
 
-## Operations
+### 3. Azure App Registration
 
-| Operation | Required Params | Description |
-|-----------|-----------------|-------------|
-| `get_pending_tasks` | - | Get unclaimed tasks |
-| `claim_task` | `task_id` | Claim a task |
-| `complete_task` | `task_id` | Mark task done |
-| `post_task` | `title`, `description` | Post a new task |
-| `post_status` | `title`, `status_text` | Post status update |
-| `post_message` | `title`, `content` | Post general message |
-| `post_handoff` | `title`, `description`, `context` | Hand off work |
-| `get_messages` | - | Get recent messages |
+Create an app registration in Azure AD with these **Application Permissions**:
 
-## Azure AD App Registration
+| Permission | Purpose |
+|------------|---------|
+| `Files.ReadWrite.All` | Read/write SharePoint files |
+| `Sites.ReadWrite.All` | Access SharePoint sites |
+| `User.Read.All` | List users (optional, for user management) |
+| `User.ReadWrite.All` | Create users (optional) |
 
-The app registration needs these API permissions:
+Don't forget to **Grant admin consent** after adding permissions.
 
-- `Sites.ReadWrite.All` (Application) - Read/write SharePoint sites
+## Usage
 
-## Message Storage
+```bash
+# Check system status
+m365 status
 
-Messages are stored as JSON files in SharePoint at:
-`/Shared Documents/AgentMessages/`
+# Dispatch a task to an agent
+m365 dispatch agent-alpha "Research caching patterns"
 
-Each message has:
-- Unique ID (e.g., `msg-abc123def456`)
-- Timestamp, agent ID, type, priority, status
-- Content and optional context
+# Broadcast to all agents
+m365 broadcast "New project starting"
+
+# View recent messages
+m365 messages -v
+
+# Start an agent session
+m365 start agent-alpha
+
+# Run message poller
+m365 poll
+```
+
+## Architecture
+
+See [orchestrator/ARCHITECTURE.md](orchestrator/ARCHITECTURE.md) for the full system design.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  CONTROLLER (your main session)                         │
+│  - Dispatches tasks to agents                           │
+│  - Monitors progress                                    │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  M365 TENANT (SharePoint)                               │
+│  └── AgentMessages/                                     │
+│      ├── msg-001.json  (task for agent-alpha)          │
+│      ├── msg-002.json  (status from agent-beta)        │
+│      └── ...                                            │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ agent-alpha   │ │ agent-beta    │ │ agent-gamma   │
+│ (researcher)  │ │ (implementer) │ │ (reviewer)    │
+│ Local session │ │ Local session │ │ Local session │
+└───────────────┘ └───────────────┘ └───────────────┘
+```
+
+## Agent Roles
+
+| Agent | Role | Description |
+|-------|------|-------------|
+| agent-alpha | researcher | Investigates problems, gathers information |
+| agent-beta | implementer | Builds solutions from specifications |
+| agent-gamma | reviewer | Reviews code, ensures quality |
+| agent-delta | coordinator | Plans work, assigns tasks |
+
+## Files
+
+```
+~/.m365-tenant/
+├── credentials.json     # Your tenant secrets (PRIVATE)
+├── config.yaml          # Agent definitions
+├── m365-orchestrator    # Main CLI
+├── start-agent-session  # Agent launcher
+├── message-poller       # Message router
+├── m365                 # Convenience wrapper
+├── sessions/            # Session state
+├── personas/            # Agent context files
+└── logs/                # Activity logs
+```
+
+## License
+
+MIT

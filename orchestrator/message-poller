@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Message poller for agent sessions.
+
+Polls SharePoint for new messages and routes them to agent sessions.
+This is a simpler alternative to webhooks that works without public URLs.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import yaml
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".m365-tenant"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+
+try:
+    import msal
+    import httpx
+except ImportError:
+    print("ERROR: pip install msal httpx pyyaml")
+    sys.exit(1)
+
+
+def load_creds():
+    return json.loads((CONFIG_DIR / "credentials.json").read_text())
+
+
+def load_config():
+    return yaml.safe_load((CONFIG_DIR / "config.yaml").read_text())
+
+
+class MessagePoller:
+    """Poll SharePoint for messages and track seen messages."""
+
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    FOLDER = "AgentMessages"
+    SEEN_FILE = CONFIG_DIR / "seen_messages.json"
+
+    def __init__(self, creds):
+        self.creds = creds
+        self._app = msal.ConfidentialClientApplication(
+            client_id=creds["app"]["client_id"],
+            client_credential=creds["app"]["client_secret"],
+            authority=f"https://login.microsoftonline.com/{creds['tenant_id']}",
+        )
+        self._http = httpx.Client(timeout=30.0)
+        self._drive_id = None
+        self._seen = self._load_seen()
+
+    def _load_seen(self):
+        if self.SEEN_FILE.exists():
+            return set(json.loads(self.SEEN_FILE.read_text()))
+        return set()
+
+    def _save_seen(self):
+        self.SEEN_FILE.write_text(json.dumps(list(self._seen)))
+
+    def _get_token(self):
+        result = self._app.acquire_token_for_client(
+            scopes=["https://graph.microsoft.com/.default"]
+        )
+        return result.get("access_token")
+
+    def _request(self, path):
+        url = f"{self.GRAPH_BASE}{path}"
+        headers = {"Authorization": f"Bearer {self._get_token()}"}
+        return self._http.get(url, headers=headers)
+
+    @property
+    def drive_id(self):
+        if not self._drive_id:
+            resp = self._request("/sites/root/drive")
+            if resp.status_code == 200:
+                self._drive_id = resp.json()["id"]
+        return self._drive_id
+
+    def poll(self):
+        """Poll for new messages. Returns list of new messages."""
+        resp = self._request(f"/drives/{self.drive_id}/root:/{self.FOLDER}:/children")
+        if resp.status_code != 200:
+            return []
+
+        new_messages = []
+        for item in resp.json().get("value", []):
+            if not item["name"].endswith(".json"):
+                continue
+            msg_id = item["name"].replace(".json", "")
+            if msg_id in self._seen:
+                continue
+
+            # Fetch message content
+            url = item.get("@microsoft.graph.downloadUrl")
+            if url:
+                content = self._http.get(url)
+                if content.status_code == 200:
+                    try:
+                        msg = content.json()
+                        new_messages.append(msg)
+                        self._seen.add(msg_id)
+                    except:
+                        pass
+
+        self._save_seen()
+        return new_messages
+
+    def mark_seen(self, msg_id):
+        """Mark a message as seen."""
+        self._seen.add(msg_id)
+        self._save_seen()
+
+
+def get_active_sessions():
+    """Get list of active agent sessions."""
+    sessions = {}
+    for f in SESSIONS_DIR.glob("*.json"):
+        info = json.loads(f.read_text())
+        if info.get("status") == "active":
+            sessions[info["agent"]] = info
+    return sessions
+
+
+def route_message(msg, sessions):
+    """Route a message to the appropriate session(s)."""
+    to = msg.get("to", "unknown")
+    msg_type = msg.get("message_type", "message")
+    title = msg.get("title", "No title")
+    from_agent = msg.get("from", "unknown")
+
+    if to == "all":
+        targets = list(sessions.keys())
+    elif to in sessions:
+        targets = [to]
+    else:
+        targets = []
+
+    if targets:
+        print(f"  → Routing to: {', '.join(targets)}")
+        # In a full implementation, this would send to the actual sessions
+        # For now, just log it
+        for target in targets:
+            log_file = CONFIG_DIR / "logs" / f"{target}.log"
+            log_file.parent.mkdir(exist_ok=True)
+            with open(log_file, "a") as f:
+                f.write(f"{datetime.now().isoformat()} | {msg_type} | {from_agent} | {title}\n")
+    else:
+        print(f"  → No active session for: {to}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Poll for agent messages")
+    parser.add_argument("--interval", type=int, default=5, help="Poll interval in seconds")
+    parser.add_argument("--once", action="store_true", help="Poll once and exit")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    creds = load_creds()
+    poller = MessagePoller(creds)
+
+    print(f"Message Poller started (interval: {args.interval}s)")
+    print("-" * 50)
+
+    while True:
+        try:
+            sessions = get_active_sessions()
+            new_messages = poller.poll()
+
+            if new_messages:
+                for msg in new_messages:
+                    icon = {"task": "📋", "status": "📊", "message": "💬", "handoff": "🔄"}.get(
+                        msg.get("message_type"), "📩"
+                    )
+                    print(f"{icon} [{msg.get('message_type'):8}] {msg.get('from', '?'):15} → {msg.get('to', '?'):15}")
+                    print(f"   {msg.get('title', 'No title')}")
+                    route_message(msg, sessions)
+            elif args.verbose:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] No new messages")
+
+            if args.once:
+                break
+
+            time.sleep(args.interval)
+
+        except KeyboardInterrupt:
+            print("\nStopped")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

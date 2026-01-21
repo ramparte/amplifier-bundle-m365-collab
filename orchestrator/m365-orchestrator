@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""M365 Multi-Agent Orchestrator.
+
+Manage agent users, sessions, and task dispatch for the M365 tenant.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import uuid
+import yaml
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Configuration paths
+CONFIG_DIR = Path.home() / ".m365-tenant"
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+CONFIG_FILE = CONFIG_DIR / "config.yaml"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+
+try:
+    import msal
+    import httpx
+except ImportError:
+    print("ERROR: Required packages not installed.")
+    print("Run: pip install msal httpx pyyaml")
+    sys.exit(1)
+
+
+def load_credentials():
+    """Load tenant credentials."""
+    if not CREDENTIALS_FILE.exists():
+        raise FileNotFoundError(f"Credentials not found: {CREDENTIALS_FILE}")
+    return json.loads(CREDENTIALS_FILE.read_text())
+
+
+def load_config():
+    """Load orchestrator configuration."""
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(f"Config not found: {CONFIG_FILE}")
+    return yaml.safe_load(CONFIG_FILE.read_text())
+
+
+def save_config(config):
+    """Save orchestrator configuration."""
+    CONFIG_FILE.write_text(yaml.dump(config, default_flow_style=False))
+
+
+class GraphClient:
+    """Microsoft Graph API client."""
+
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+    def __init__(self, creds):
+        self.creds = creds
+        self._app = msal.ConfidentialClientApplication(
+            client_id=creds["app"]["client_id"],
+            client_credential=creds["app"]["client_secret"],
+            authority=f"https://login.microsoftonline.com/{creds['tenant_id']}",
+        )
+        self._http = httpx.Client(timeout=30.0)
+
+    def _get_token(self):
+        result = self._app.acquire_token_for_client(
+            scopes=["https://graph.microsoft.com/.default"]
+        )
+        if "access_token" in result:
+            return result["access_token"]
+        raise RuntimeError(f"Auth failed: {result.get('error_description', result)}")
+
+    def request(self, method, path, json_data=None, content=None):
+        url = f"{self.GRAPH_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {self._get_token()}",
+            "Content-Type": "application/json",
+        }
+        if content:
+            return self._http.request(method, url, headers=headers, content=content)
+        elif json_data:
+            return self._http.request(method, url, headers=headers, json=json_data)
+        return self._http.request(method, url, headers=headers)
+
+
+class UserManager:
+    """Manage agent users in the tenant."""
+
+    def __init__(self, client: GraphClient, domain: str):
+        self.client = client
+        self.domain = domain
+
+    def list_users(self):
+        """List all users in tenant."""
+        resp = self.client.request("GET", "/users?$select=id,displayName,userPrincipalName,mail")
+        if resp.status_code == 200:
+            return resp.json().get("value", [])
+        return []
+
+    def get_user(self, username: str):
+        """Get a specific user."""
+        upn = f"{username}@{self.domain}" if "@" not in username else username
+        resp = self.client.request("GET", f"/users/{upn}")
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+
+    def create_user(self, username: str, display_name: str, password: str = None):
+        """Create a new user."""
+        if password is None:
+            password = f"Agent{uuid.uuid4().hex[:8]}!"
+        
+        user_data = {
+            "accountEnabled": True,
+            "displayName": display_name,
+            "mailNickname": username,
+            "userPrincipalName": f"{username}@{self.domain}",
+            "passwordProfile": {
+                "forceChangePasswordNextSignIn": False,
+                "password": password,
+            },
+        }
+        
+        resp = self.client.request("POST", "/users", json_data=user_data)
+        if resp.status_code == 201:
+            user = resp.json()
+            return {"success": True, "user": user, "password": password}
+        else:
+            return {"success": False, "error": resp.text}
+
+    def delete_user(self, username: str):
+        """Delete a user."""
+        upn = f"{username}@{self.domain}" if "@" not in username else username
+        resp = self.client.request("DELETE", f"/users/{upn}")
+        return resp.status_code == 204
+
+
+class MessageBoard:
+    """SharePoint message board for agent communication."""
+
+    FOLDER = "AgentMessages"
+
+    def __init__(self, client: GraphClient):
+        self.client = client
+        self._drive_id = None
+
+    @property
+    def drive_id(self):
+        if not self._drive_id:
+            resp = self.client.request("GET", "/sites/root/drive")
+            if resp.status_code == 200:
+                self._drive_id = resp.json()["id"]
+        return self._drive_id
+
+    def post_message(self, from_agent: str, to_agent: str, msg_type: str,
+                     title: str, content: str, priority: str = "normal", context: dict = None):
+        """Post a message to the board."""
+        # Ensure folder exists
+        self.client.request(
+            "POST", f"/drives/{self.drive_id}/root/children",
+            json_data={"name": self.FOLDER, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+        )
+
+        msg = {
+            "id": f"msg-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "from": from_agent,
+            "to": to_agent,
+            "message_type": msg_type,
+            "title": title,
+            "content": content,
+            "priority": priority,
+            "status": "pending" if msg_type == "task" else "delivered",
+            "context": context or {},
+        }
+
+        resp = self.client.request(
+            "PUT",
+            f"/drives/{self.drive_id}/root:/{self.FOLDER}/{msg['id']}.json:/content",
+            content=json.dumps(msg, indent=2).encode()
+        )
+        return msg if resp.status_code in (200, 201) else None
+
+    def get_messages(self, for_agent: str = None, msg_type: str = None, limit: int = 50):
+        """Get messages from the board."""
+        resp = self.client.request(
+            "GET", f"/drives/{self.drive_id}/root:/{self.FOLDER}:/children?$top={limit}"
+        )
+        if resp.status_code != 200:
+            return []
+
+        messages = []
+        for item in resp.json().get("value", []):
+            if not item["name"].endswith(".json"):
+                continue
+            url = item.get("@microsoft.graph.downloadUrl")
+            if url:
+                content = httpx.get(url)
+                if content.status_code == 200:
+                    try:
+                        msg = content.json()
+                        if for_agent and msg.get("to") not in [for_agent, "all"]:
+                            continue
+                        if msg_type and msg.get("message_type") != msg_type:
+                            continue
+                        messages.append(msg)
+                    except:
+                        pass
+        return sorted(messages, key=lambda m: m.get("timestamp", ""), reverse=True)
+
+
+class SessionManager:
+    """Manage local Amplifier sessions bound to agents."""
+
+    def __init__(self):
+        SESSIONS_DIR.mkdir(exist_ok=True)
+
+    def list_sessions(self):
+        """List all registered sessions."""
+        sessions = []
+        for f in SESSIONS_DIR.glob("*.json"):
+            sessions.append(json.loads(f.read_text()))
+        return sessions
+
+    def get_session(self, agent_name: str):
+        """Get session info for an agent."""
+        session_file = SESSIONS_DIR / f"{agent_name}.json"
+        if session_file.exists():
+            return json.loads(session_file.read_text())
+        return None
+
+    def register_session(self, agent_name: str, session_id: str, port: int = None):
+        """Register a session binding."""
+        session_file = SESSIONS_DIR / f"{agent_name}.json"
+        session_info = {
+            "agent": agent_name,
+            "session_id": session_id,
+            "port": port,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "status": "active",
+        }
+        session_file.write_text(json.dumps(session_info, indent=2))
+        return session_info
+
+    def unregister_session(self, agent_name: str):
+        """Unregister a session."""
+        session_file = SESSIONS_DIR / f"{agent_name}.json"
+        if session_file.exists():
+            session_file.unlink()
+            return True
+        return False
+
+
+def cmd_users_list(args):
+    """List all users."""
+    creds = load_credentials()
+    config = load_config()
+    client = GraphClient(creds)
+    users = UserManager(client, config["tenant"]["domain"])
+    
+    for user in users.list_users():
+        print(f"  {user['displayName']:20} {user['userPrincipalName']}")
+
+
+def cmd_users_create(args):
+    """Create a user."""
+    creds = load_credentials()
+    config = load_config()
+    client = GraphClient(creds)
+    users = UserManager(client, config["tenant"]["domain"])
+
+    # Find agent config
+    agent_config = None
+    for agent in config.get("agents", []):
+        if agent["name"] == args.username:
+            agent_config = agent
+            break
+
+    display_name = agent_config["display_name"] if agent_config else args.username.title()
+    
+    result = users.create_user(args.username, display_name)
+    if result["success"]:
+        print(f"✓ Created user: {args.username}@{config['tenant']['domain']}")
+        print(f"  Password: {result['password']}")
+        
+        # Save password to session file
+        session_file = SESSIONS_DIR / f"{args.username}.json"
+        session_info = {
+            "agent": args.username,
+            "user_id": result["user"]["id"],
+            "upn": result["user"]["userPrincipalName"],
+            "password": result["password"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": None,
+            "status": "created",
+        }
+        session_file.write_text(json.dumps(session_info, indent=2))
+    else:
+        print(f"✗ Failed: {result['error']}")
+
+
+def cmd_users_create_all(args):
+    """Create all configured agents."""
+    creds = load_credentials()
+    config = load_config()
+    client = GraphClient(creds)
+    users = UserManager(client, config["tenant"]["domain"])
+
+    for agent in config.get("agents", []):
+        existing = users.get_user(agent["name"])
+        if existing:
+            print(f"  {agent['name']:15} already exists")
+            continue
+
+        result = users.create_user(agent["name"], agent["display_name"])
+        if result["success"]:
+            print(f"✓ {agent['name']:15} created (password: {result['password']})")
+            
+            # Save to session file
+            session_file = SESSIONS_DIR / f"{agent['name']}.json"
+            session_info = {
+                "agent": agent["name"],
+                "role": agent.get("role"),
+                "description": agent.get("description"),
+                "user_id": result["user"]["id"],
+                "upn": result["user"]["userPrincipalName"],
+                "password": result["password"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": None,
+                "status": "created",
+            }
+            session_file.write_text(json.dumps(session_info, indent=2))
+        else:
+            print(f"✗ {agent['name']:15} failed: {result['error'][:50]}")
+
+
+def cmd_sessions_list(args):
+    """List sessions."""
+    sm = SessionManager()
+    sessions = sm.list_sessions()
+    
+    if not sessions:
+        print("No sessions registered")
+        return
+
+    print(f"{'Agent':15} {'Role':12} {'Status':10} {'Session ID':40}")
+    print("-" * 80)
+    for s in sessions:
+        print(f"{s['agent']:15} {s.get('role', '-'):12} {s['status']:10} {s.get('session_id', '-') or '-':40}")
+
+
+def cmd_dispatch(args):
+    """Dispatch a task to an agent."""
+    creds = load_credentials()
+    client = GraphClient(creds)
+    board = MessageBoard(client)
+
+    msg = board.post_message(
+        from_agent="controller",
+        to_agent=args.agent,
+        msg_type="task",
+        title=args.title or "Task from Controller",
+        content=args.instruction,
+        priority=args.priority,
+    )
+
+    if msg:
+        print(f"✓ Dispatched task {msg['id']} to {args.agent}")
+        print(f"  Title: {msg.get('title', 'No title')}")
+    else:
+        print("✗ Failed to dispatch")
+
+
+def cmd_broadcast(args):
+    """Broadcast to all agents."""
+    creds = load_credentials()
+    client = GraphClient(creds)
+    board = MessageBoard(client)
+
+    msg = board.post_message(
+        from_agent="controller",
+        to_agent="all",
+        msg_type="message",
+        title=args.title or "Broadcast from Controller",
+        content=args.message,
+        priority=args.priority,
+    )
+
+    if msg:
+        print(f"✓ Broadcast {msg['id']} to all agents")
+    else:
+        print("✗ Failed to broadcast")
+
+
+def cmd_messages(args):
+    """List messages."""
+    creds = load_credentials()
+    client = GraphClient(creds)
+    board = MessageBoard(client)
+
+    messages = board.get_messages(for_agent=args.agent, limit=args.limit)
+    
+    for msg in messages:
+        status = msg.get("status", "?")
+        icon = {"pending": "⏳", "in_progress": "🔄", "completed": "✓", "delivered": "📨"}.get(status, "?")
+        print(f"{icon} [{msg.get('message_type', 'message'):8}] {msg.get('from', 'unknown'):15} → {msg.get('to', 'unknown'):15} | {msg.get('title', 'No title')}")
+        if args.verbose:
+            print(f"   {msg['content'][:100]}...")
+            print()
+
+
+def cmd_status(args):
+    """Show overall status."""
+    creds = load_credentials()
+    config = load_config()
+    client = GraphClient(creds)
+    users = UserManager(client, config["tenant"]["domain"])
+    board = MessageBoard(client)
+    sm = SessionManager()
+
+    print("=== Tenant ===")
+    print(f"  Domain: {config['tenant']['domain']}")
+    
+    print("\n=== Agent Users ===")
+    all_users = users.list_users()
+    agent_names = [a["name"] for a in config.get("agents", [])]
+    for agent in config.get("agents", []):
+        email = agent.get("email", f"{agent['name']}@{config['tenant']['domain']}")
+        exists = any(u["userPrincipalName"].lower() == email.lower() for u in all_users)
+        status = '✓ mapped' if exists else '✗ user not found'
+        print(f"  {agent['name']:15} {agent['role']:12} {status}")
+
+    print("\n=== Sessions ===")
+    sessions = sm.list_sessions()
+    for s in sessions:
+        print(f"  {s['agent']:15} {s['status']:10}")
+
+    print("\n=== Recent Messages ===")
+    messages = board.get_messages(limit=5)
+    for msg in messages:
+        print(f"  {msg.get('from', 'unknown'):15} → {msg.get('to', 'unknown'):15} | {msg.get('title', 'No title')[:40]}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="M365 Multi-Agent Orchestrator")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # Users commands
+    users_parser = sub.add_parser("users", help="Manage agent users")
+    users_sub = users_parser.add_subparsers(dest="users_cmd", required=True)
+    users_sub.add_parser("list", help="List users")
+    create_parser = users_sub.add_parser("create", help="Create a user")
+    create_parser.add_argument("username")
+    users_sub.add_parser("create-all", help="Create all configured agents")
+
+    # Sessions commands
+    sessions_parser = sub.add_parser("sessions", help="Manage sessions")
+    sessions_sub = sessions_parser.add_subparsers(dest="sessions_cmd", required=True)
+    sessions_sub.add_parser("list", help="List sessions")
+
+    # Dispatch command
+    dispatch_parser = sub.add_parser("dispatch", help="Dispatch task to agent")
+    dispatch_parser.add_argument("agent", help="Agent name or 'all'")
+    dispatch_parser.add_argument("instruction", help="Task instruction")
+    dispatch_parser.add_argument("--title", help="Task title")
+    dispatch_parser.add_argument("--priority", default="normal", choices=["high", "normal", "low"])
+
+    # Broadcast command
+    broadcast_parser = sub.add_parser("broadcast", help="Broadcast to all agents")
+    broadcast_parser.add_argument("message", help="Message content")
+    broadcast_parser.add_argument("--title", help="Message title")
+    broadcast_parser.add_argument("--priority", default="normal")
+
+    # Messages command
+    messages_parser = sub.add_parser("messages", help="List messages")
+    messages_parser.add_argument("--agent", help="Filter by agent")
+    messages_parser.add_argument("--limit", type=int, default=20)
+    messages_parser.add_argument("-v", "--verbose", action="store_true")
+
+    # Status command
+    sub.add_parser("status", help="Show overall status")
+
+    args = parser.parse_args()
+
+    if args.command == "users":
+        if args.users_cmd == "list":
+            cmd_users_list(args)
+        elif args.users_cmd == "create":
+            cmd_users_create(args)
+        elif args.users_cmd == "create-all":
+            cmd_users_create_all(args)
+    elif args.command == "sessions":
+        if args.sessions_cmd == "list":
+            cmd_sessions_list(args)
+    elif args.command == "dispatch":
+        cmd_dispatch(args)
+    elif args.command == "broadcast":
+        cmd_broadcast(args)
+    elif args.command == "messages":
+        cmd_messages(args)
+    elif args.command == "status":
+        cmd_status(args)
+
+
+if __name__ == "__main__":
+    main()

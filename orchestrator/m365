@@ -1,0 +1,69 @@
+#!/bin/bash
+# M365 Multi-Agent Orchestrator - convenience wrapper
+
+CONFIG_DIR="$HOME/.m365-tenant"
+cd "$CONFIG_DIR"
+
+# Load credentials into environment
+if [ -f "$CONFIG_DIR/credentials.json" ]; then
+    export M365_TENANT_ID=$(jq -r '.tenant_id' "$CONFIG_DIR/credentials.json")
+    export M365_CLIENT_ID=$(jq -r '.app.client_id' "$CONFIG_DIR/credentials.json")
+    export M365_CLIENT_SECRET=$(jq -r '.app.client_secret' "$CONFIG_DIR/credentials.json")
+fi
+
+case "$1" in
+    status)
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator status
+        ;;
+    dispatch)
+        shift
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator dispatch "$@"
+        ;;
+    broadcast)
+        shift
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator broadcast "$@"
+        ;;
+    messages)
+        shift
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator messages "$@"
+        ;;
+    sessions)
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator sessions list
+        ;;
+    start)
+        shift
+        uv run --with msal --with httpx --with pyyaml python start-agent-session "$@"
+        ;;
+    poll)
+        shift
+        uv run --with msal --with httpx --with pyyaml python message-poller "$@"
+        ;;
+    users)
+        shift
+        uv run --with msal --with httpx --with pyyaml python m365-orchestrator users "$@"
+        ;;
+    help|--help|-h)
+        echo "M365 Multi-Agent Orchestrator"
+        echo ""
+        echo "Commands:"
+        echo "  status              Show overall system status"
+        echo "  dispatch <agent> <instruction>  Send task to specific agent"
+        echo "  broadcast <message> Send message to all agents"
+        echo "  messages [--agent X] List recent messages"
+        echo "  sessions            List agent sessions"
+        echo "  start <agent>       Start an agent session"
+        echo "  poll [--interval N] Start message poller"
+        echo "  users list|create-all  Manage users"
+        echo ""
+        echo "Examples:"
+        echo "  m365 status"
+        echo "  m365 dispatch agent-alpha 'Research caching patterns'"
+        echo "  m365 broadcast 'Stand by for new project'"
+        echo "  m365 start agent-alpha"
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'm365 help' for usage"
+        exit 1
+        ;;
+esac
