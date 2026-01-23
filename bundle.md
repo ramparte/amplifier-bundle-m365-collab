@@ -5,7 +5,8 @@ bundle:
   description: M365 multi-agent collaboration via SharePoint
 
 tools:
-  - m365_collab
+  - module: tool-m365-collab
+    source: git+https://github.com/ramparte/amplifier-bundle-m365-collab@main
 ---
 
 # M365 Multi-Agent Collaboration
